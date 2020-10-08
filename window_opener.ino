@@ -1,6 +1,10 @@
 #include <Servo.h>
+#include <Adafruit_INA260.h>
 
 #define RFID Serial1
+
+Adafruit_INA260 ina260 = Adafruit_INA260();
+const double CURRENT_LIMIT = 320.; 
 
 // Authorized list of RFIDs.
 const int NUM_CATS = 2;
@@ -72,6 +76,12 @@ void setup() {
 
     digitalWrite(PIN_SERVO_ENABLE, HIGH); 
 
+    if (!ina260.begin()) {
+      if (debug) Serial.println("Couldn't find INA260 chip");
+    } else {
+      if (debug) Serial.println("Found INA260 current sensor.");
+    }
+    
     lastEventStartTime = millis();
     if (debug) Serial.println("Setup complete.");
 }
@@ -201,12 +211,11 @@ void loop() {
 
             // Stop opening when the endstop is triggered or too much time elapses. If a tag gets authenticated during
             // this time. Reopen the window for the duration we had been closing it (or until endstop).
-            if (authenticateRFID() >= 0) {
+            if (authenticateRFID() >= 0 || (ina260.readCurrent() > CURRENT_LIMIT && (millis() - lastEventStartTime) > 1000)) {
                 if (debug) Serial.println("Tag authenticated during window closing. Reopening.");
                 unsigned long timeToReopen = millis() - lastEventStartTime; // How much time have we been closing the window so far?
                 lastEventStartTime = millis() - (windowMovementTimeout - timeToReopen); // Cheat the timeout. Set the current time to be in the future so the timeout triggers after the amount of time we had been closing the window elapses.
-                currentState = OPENING;
-
+                currentState = OPENING; 
             } else if (digitalRead(PIN_ENDSTOP_CLOSE) == LOW || (millis() - lastEventStartTime > maxClosingTime)) {
                 if (debug) Serial.println("Window is done closing.");
 
