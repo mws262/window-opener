@@ -1,11 +1,14 @@
 #include <Servo.h>
 #include <Adafruit_INA260.h>
+#include <VescUart.h>
 
 #define RFID Serial1
+#define VESC_SERIAL Serial2
 #include <SPI.h>
 #include <NativeEthernet.h>
 #include <NativeEthernetUdp.h>
 
+VescUart vesc;
 Adafruit_INA260 ina260 = Adafruit_INA260();
 const double CURRENT_LIMIT = 320.; 
 
@@ -39,6 +42,9 @@ const int LOCK_OPEN_VAL = 130;
 const int LOCK_DURATION = 2000; // Milliseconds for the lock to complete opening or closing.
 
 const int LOOP_DELAY = 50; // Too shaort and entire messages might not come in in time between loops. One downside of polling everything.
+
+const float RPM_OPENING = 100; // TODO
+const float RPM_CLOSING = -50; // TODO 
 
 const bool debug = true;
 
@@ -97,7 +103,6 @@ int setupEthernet() {
     } else if (Ethernet.linkStatus() == LinkOFF) {
       Serial.println("Ethernet cable is not connected.");
     }
-    // no point in carrying on, so do nothing forevermore:
     return 0;
   }
   Udp.begin(localPort);
@@ -129,6 +134,10 @@ void setup() {
     }
 
     setupEthernet();
+
+    VESC_SERIAL.begin(19200);
+    while (!VESC_SERIAL) {;}
+    vesc.setSerialPort(&VESC_SERIAL);
     
     lastEventStartTime = millis();
     if (debug) Serial.println("Setup complete.");
@@ -139,8 +148,9 @@ void updateTime() {
 
   unsigned long timeSinceLastUpdate = millis() - lastTimeUpdate;
   // Only synchonize from the internet occasionally.
-  if (timeSinceLastUpdatev > timeCheckInterval) {
-    Serial.println("About to check the current time from the web.");
+  if (timeSinceLastUpdate > timeCheckInterval) {
+    if (debug)
+      Serial.println("About to check the current time from the web.");
     // set all bytes in the buffer to 0
     memset(packetBuffer, 0, NTP_PACKET_SIZE);
     // Initialize values needed to form NTP request
@@ -160,28 +170,34 @@ void updateTime() {
     Udp.beginPacket(timeServer, 123); // NTP requests are to port 123
     Udp.write(packetBuffer, NTP_PACKET_SIZE);
     Udp.endPacket();
-  
-    Serial.println("Sent time check message. Waiting for a response from the server");
+    if (debug) 
+      Serial.println("Sent time check message. Waiting for a response from the server");
+    bool packetReceived = true;
     int totalWaitTime = 0;
     while (!Udp.parsePacket()) {
       delay(100);
       totalWaitTime += 100;
   
       if (totalWaitTime > timeCheckTimeout) {
-        Serial.println("Time check timout exceeded. Failed to retrieve time.");
-        return;
+        packetReceived = false;
+        if (debug)
+          Serial.println("Time check timout exceeded. Failed to retrieve time.");
+        break;
       }
     }
-  
-    unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
-    unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
-    // combine the four bytes (two words) into a long integer
-    // this is NTP time (seconds since Jan 1 1900):
-    unsigned long secsSince1900 = highWord << 16 | lowWord;
-    // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
-    const unsigned long seventyYears = 2208988800UL;
-    // subtract seventy years:
-    lastEpochRetrieved = secsSince1900 - seventyYears;
+
+    if (packetReceived) {
+      unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+      unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+      // combine the four bytes (two words) into a long integer
+      // this is NTP time (seconds since Jan 1 1900):
+      unsigned long secsSince1900 = highWord << 16 | lowWord;
+      // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:
+      const unsigned long seventyYears = 2208988800UL;
+      // subtract seventy years:
+      lastEpochRetrieved = secsSince1900 - seventyYears;
+      timeSinceLastUpdate = 0;
+    }
     lastTimeUpdate = millis();
     Ethernet.maintain(); 
   }
@@ -193,7 +209,7 @@ void updateTime() {
   secondTime = epoch % 60;
 
   // print the hour, minute and second:
-  if (secondTime == 0) { // TODO I Want to print once per minute. I expect this will spam messages a few times at the beginning of each minute though.
+  if (debug && secondTime == 0) { // TODO I Want to print once per minute. I expect this will spam messages a few times at the beginning of each minute though.
     Serial.print("Hour: ");
     Serial.print(hourTime); 
     Serial.print(" Minute: "); 
@@ -272,7 +288,7 @@ void loop() {
             // Don't check time or enforce curfew unless the system is idle.
             updateTime();
 
-            if (hourTime > curfewStartTime || hourTime < curfewEndTime)) {
+            if (hourTime > curfewStartTime || hourTime < curfewEndTime) {
               currentState = CURFEW;
               break;
             }
@@ -287,7 +303,7 @@ void loop() {
 
         case CURFEW:
             updateTime();
-            if (hourTime < curfewStartTime && hourTime > curfewEndTime)) {
+            if (hourTime < curfewStartTime && hourTime > curfewEndTime) {
               currentState = IDLE_CLOSED;
             }
             delay(LOOP_DELAY * 100);
@@ -307,14 +323,13 @@ void loop() {
 
         case OPENING:
             // Start opening the window. Keep going until a time threshold or the endstop is hit. TODO: different durations for differently sized animals.
-            digitalWrite(PIN_MOTOR_CLOSE, LOW);
-            digitalWrite(PIN_MOTOR_OPEN, HIGH);
+            vesc.setRPM(RPM_OPENING);
 
             // Stop opening when the endstop is triggered or too much time elapses.
             if (digitalRead(PIN_ENDSTOP_OPEN) == LOW || (millis() - lastEventStartTime > windowMovementTimeout)) {
                 if (debug) Serial.println("Window is done opening.");
 
-                digitalWrite(PIN_MOTOR_OPEN, LOW);
+                vesc.setCurrent(0.f);
                 currentState = WAITING_OPEN;
                 lastEventStartTime = millis();
             }
@@ -336,8 +351,7 @@ void loop() {
             break;
 
         case CLOSING:
-            digitalWrite(PIN_MOTOR_OPEN, LOW);
-            digitalWrite(PIN_MOTOR_CLOSE, HIGH);
+            vesc.setRPM(RPM_CLOSING);
 
             // Stop opening when the endstop is triggered or too much time elapses. If a tag gets authenticated during
             // this time. Reopen the window for the duration we had been closing it (or until endstop).
@@ -349,7 +363,7 @@ void loop() {
             } else if (digitalRead(PIN_ENDSTOP_CLOSE) == LOW || (millis() - lastEventStartTime > maxClosingTime)) {
                 if (debug) Serial.println("Window is done closing.");
 
-                digitalWrite(PIN_MOTOR_CLOSE, LOW);
+                vesc.setCurrent(0.f);
                 currentState = LOCKING;
             }
             delay(LOOP_DELAY);
