@@ -1,16 +1,15 @@
+#define RFID Serial1
+#define VESC_SERIAL Serial2
+
 #include <Servo.h>
 #include <Adafruit_INA260.h>
 #include <VescUart.h>
-
-#define RFID Serial1
-#define VESC_SERIAL Serial2
 #include <SPI.h>
 #include <NativeEthernet.h>
 #include <NativeEthernetUdp.h>
 
 VescUart vesc;
-Adafruit_INA260 ina260 = Adafruit_INA260();
-const double CURRENT_LIMIT = 320.; 
+const float CURRENT_LIMIT = 2.; // TODO tune this.
 
 // Authorized list of RFIDs.
 const int NUM_CATS = 2;
@@ -20,11 +19,6 @@ const char catAuthID[NUM_CATS][MAX_ID_LEN] = {"F98200041199001878", // Tonks.
                                            "985141002571129"};
 const char dogAuthID[NUM_DOGS][MAX_ID_LEN] = {"F9000202060000037A", // Test tag.
                                            "todoPIPER"};                                           
-
-// Driving pins to motor hbridge.
-const int PIN_MOTOR_CLOSE = 11;
-const int PIN_MOTOR_OPEN = 10;
-
 // Endstop pins.
 const int PIN_ENDSTOP_CLOSE = 51;
 const int PIN_ENDSTOP_OPEN = 9;
@@ -118,20 +112,12 @@ void setup() {
     lock_servo.attach(PIN_LOCK_SERVO);
     lock_servo.write(LOCK_CLOSE_VAL);
 
-    pinMode(PIN_MOTOR_CLOSE, OUTPUT);
-    pinMode(PIN_MOTOR_OPEN, OUTPUT);
     pinMode(PIN_SERVO_ENABLE, OUTPUT);
     pinMode(PIN_ENDSTOP_CLOSE, INPUT);
     pinMode(PIN_ENDSTOP_OPEN, INPUT);
     pinMode(PIN_SWITCH, INPUT);
 
     digitalWrite(PIN_SERVO_ENABLE, HIGH); 
-
-    if (!ina260.begin()) {
-      if (debug) Serial.println("Couldn't find INA260 chip");
-    } else {
-      if (debug) Serial.println("Found INA260 current sensor.");
-    }
 
     setupEthernet();
 
@@ -238,7 +224,7 @@ int authenticateRFID() {
                     Serial.println(" identified!");
                 }
                 windowMovementTimeout = catWindowTime;
-                return i;
+                return 1;
             }
         }
 
@@ -249,7 +235,7 @@ int authenticateRFID() {
                     Serial.println(" identified!");
                 }
                 windowMovementTimeout = dogWindowTime;
-                return i;
+                return 2;
             }
         }
     }else {
@@ -352,19 +338,29 @@ void loop() {
 
         case CLOSING:
             vesc.setRPM(RPM_CLOSING);
-
+            vesc.getVescValues();
+            
             // Stop opening when the endstop is triggered or too much time elapses. If a tag gets authenticated during
             // this time. Reopen the window for the duration we had been closing it (or until endstop).
-            if (authenticateRFID() >= 0 || (ina260.readCurrent() > CURRENT_LIMIT && (millis() - lastEventStartTime) > 1000)) {
+            
+            int tagCheck = authenticateRFID();
+            if (tagCheck >= 0 || ( vesc.data.avgMotorCurrent > CURRENT_LIMIT && (millis() - lastEventStartTime) > 1000)) {
                 if (debug) Serial.println("Tag authenticated during window closing. Reopening.");
-                unsigned long timeToReopen = millis() - lastEventStartTime; // How much time have we been closing the window so far?
-                lastEventStartTime = millis() - (windowMovementTimeout - timeToReopen); // Cheat the timeout. Set the current time to be in the future so the timeout triggers after the amount of time we had been closing the window elapses.
+
+                // For cats, only reopen for the length of time the window has been closing to maintain the same final aperture of the window.
+                // For dogs or button presses, just open until the endstop is hit.
+                if (tagCheck == 1) {
+                  unsigned long timeToReopen = millis() - lastEventStartTime; // How much time have we been closing the window so far?
+                  lastEventStartTime = millis() - (windowMovementTimeout - timeToReopen); // Cheat the timeout. Set the current time to be in the future so the timeout triggers after the amount of time we had been closing the window elapses.
+                } else {
+                  lastEventStartTime = millis();
+                }
+                
                 currentState = OPENING; 
             } else if (digitalRead(PIN_ENDSTOP_CLOSE) == LOW || (millis() - lastEventStartTime > maxClosingTime)) {
-                if (debug) Serial.println("Window is done closing.");
-
                 vesc.setCurrent(0.f);
                 currentState = LOCKING;
+                if (debug) Serial.println("Window is done closing.");
             }
             delay(LOOP_DELAY);
             break;
