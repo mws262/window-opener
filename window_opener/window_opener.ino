@@ -1,51 +1,19 @@
-#define RFID Serial1
-#define VESC_SERIAL Serial2
+#define RFID_SERIAL Serial1
+#define VESC_SERIAL Serial5
 
-#include <Servo.h>
-#include <Adafruit_INA260.h>
 #include <VescUart.h>
 #include <SPI.h>
 #include <NativeEthernet.h>
 #include <NativeEthernetUdp.h>
 
-VescUart vesc;
-const float CURRENT_LIMIT = 2.; // TODO tune this.
-
-// Authorized list of RFIDs.
-const int NUM_CATS = 2;
-const int NUM_DOGS = 2;
-const int MAX_ID_LEN = 20;
-const char catAuthID[NUM_CATS][MAX_ID_LEN] = {"F98200041199001878", // Tonks.
-                                           "985141002571129"};
-const char dogAuthID[NUM_DOGS][MAX_ID_LEN] = {"F9000202060000037A", // Test tag.
-                                           "todoPIPER"};                                           
-// Endstop pins.
-const int PIN_ENDSTOP_CLOSE = 51;
-const int PIN_ENDSTOP_OPEN = 9;
-
-// Window lock servo pin.
-const int PIN_SERVO_ENABLE = 53; // NOTE: enabled when sent a LOW logic level.
-const int PIN_LOCK_SERVO = 28;
-
-// Momentary switch to open the window without a tag read.
-const int PIN_SWITCH = 52;
-
-Servo lock_servo;
-const int LOCK_CLOSE_VAL = 25; // Servo pwms for min and max range of the servo.
-const int LOCK_OPEN_VAL = 130;
-const int LOCK_DURATION = 2000; // Milliseconds for the lock to complete opening or closing.
-
-const int LOOP_DELAY = 50; // Too shaort and entire messages might not come in in time between loops. One downside of polling everything.
-
-const float RPM_OPENING = 100; // TODO
-const float RPM_CLOSING = -50; // TODO 
-
+/* General operating parameters */
+const bool enforceCurfew = false;
+const uint8_t curfewStartTime = 22; // 10PM
+const uint8_t curfewEndTime = 7;
 const bool debug = true;
-
+const int LOOP_DELAY = 50; // Too shaort and entire messages might not come in in time between loops. One downside of polling everything.
 enum State {
     IDLE_CLOSED,
-    UNLOCKING,
-    LOCKING,
     OPENING,
     WAITING_OPEN,
     CLOSING,
@@ -55,15 +23,50 @@ enum State {
 // Start in closing mode, so if power is lost, the window can't get stuck open.
 State currentState = CLOSING;
 
+/* Vesc motor control parameters */
+VescUart vesc;
+const float CURRENT_LIMIT = 1.0; // TODO tune this.
+const float MOTOR_DUTY_BASELINE = 0.04;
+const float MOTOR_DUTY_SLOW = 0.03;
+long lastTach = 0;
+
+  float tachFullScale = 1800;
+  float currTach = 0.0;
+  float minDuty = 0.03;
+  float maxDuty = 0.15;
+  float slowPoint = tachFullScale/12.;
+
+  float tachClosed = 0.0;
+  float tachTarget = 0.0;
+
+  float catTach = tachFullScale / 2.0;
+  float dogTach = tachFullScale;
+  float buttonTach = tachFullScale;
+ 
+
+/* RFID parameters */
+const int NUM_CATS = 2;
+const int NUM_DOGS = 2;
+const int MAX_ID_LEN = 20;
+const char catAuthID[NUM_CATS][MAX_ID_LEN] = {"F98200041199001878", // Tonks.
+                                           "985141002571129"};
+const char dogAuthID[NUM_DOGS][MAX_ID_LEN] = {"F9000202060000037A", // Piper collar.
+                                           "todoPIPEREmbedded"};                                           
+
+/* Switch parameters */
+// Endstop pins.
+const int PIN_ENDSTOP_CLOSE = 18;
+const int PIN_ENDSTOP_OPEN = 19;
+
+// Momentary switch to open the window without a tag read.
+const int MANUAL_OPEN_PIN = 17;
+
 unsigned long lastEventStartTime;
 const int stayOpenDuration = 4000; // Milliseconds.
-const int catWindowTime = 8000;
-const int dogWindowTime = 28000;
-const int maxClosingTime = 45000;
-int windowMovementTimeout = dogWindowTime;
+const int windowMovementTimeout = 15000; // No single motion should take longer than this.
 
 
-// FOR ETHERNET TIME SYNCING.
+/* Parameters for synchronizing clock via ethernet */
 // Enter a MAC address for your controller below.
 // Newer Ethernet shields have a MAC address printed on a sticker on the shield
 byte mac[] = {
@@ -84,9 +87,7 @@ unsigned long lastTimeUpdate = 0;
 const unsigned long timeCheckInterval = 1 * (60 * 60 * 1000); // 1 hr in milliseconds. 
 unsigned long lastEpochRetrieved = 0; // Seconds since 1970 retrieved from the internet.
 
-const uint8_t curfewStartTime = 22; // 10PM
-const uint8_t curfewEndTime = 7;
-
+/* Initiate connection to online clock. */
 int setupEthernet() {
     // start Ethernet and UDP
   if (Ethernet.begin(mac) == 0) {
@@ -104,32 +105,24 @@ int setupEthernet() {
 }
 
 void setup() {
-
-    // initialize both serial ports:
     if (debug) Serial.begin(9600); // Default serial is for communicating with the computer for debugging. Should eventually be eliminated.
 
-    RFID.begin(9600); // Serial 1 is for communication with the RFID board. Information only flows in from it.
-    lock_servo.attach(PIN_LOCK_SERVO);
-    lock_servo.write(LOCK_CLOSE_VAL);
-
-    pinMode(PIN_SERVO_ENABLE, OUTPUT);
-    pinMode(PIN_ENDSTOP_CLOSE, INPUT);
-    pinMode(PIN_ENDSTOP_OPEN, INPUT);
-    pinMode(PIN_SWITCH, INPUT);
-
-    digitalWrite(PIN_SERVO_ENABLE, HIGH); 
-
-    setupEthernet();
-
+    RFID_SERIAL.begin(9600); // Serial 1 is for communication with the RFID board. Information only flows in from it.
     VESC_SERIAL.begin(19200);
     while (!VESC_SERIAL) {;}
     vesc.setSerialPort(&VESC_SERIAL);
-    
+
+    pinMode(PIN_ENDSTOP_CLOSE, INPUT);
+    pinMode(PIN_ENDSTOP_OPEN, INPUT);
+    pinMode(MANUAL_OPEN_PIN, INPUT);
+
+    setupEthernet();
+
     lastEventStartTime = millis();
     if (debug) Serial.println("Setup complete.");
 }
 
-// Update the current real time. Occasionlly check the internet. Keep track locally in between.
+// Update the current real time. Occasionlly check the internet. Keep track of time locally in between.
 void updateTime() {
 
   unsigned long timeSinceLastUpdate = millis() - lastTimeUpdate;
@@ -206,13 +199,13 @@ void updateTime() {
 // Read from the serial buffer and check for a valid RFID tag. Returns the index of the tag id or -1 if the not authenticated.
 int authenticateRFID() {
   
-    if (RFID.available()) {
+    if (RFID_SERIAL.available()) {
       char id[64];
       char byteRead;
       
-      int availableBytes = RFID.available();
+      int availableBytes = RFID_SERIAL.available();
       for (int i = 0; i < availableBytes; i++) {
-         id[i] = RFID.read();
+         id[i] = RFID_SERIAL.read();
          id[i+1] = '\0'; // Append a null
       }
 
@@ -223,7 +216,7 @@ int authenticateRFID() {
                     Serial.print(catAuthID[i]);
                     Serial.println(" identified!");
                 }
-                windowMovementTimeout = catWindowTime;
+                tachTarget = tachClosed + catTach;
                 return 1;
             }
         }
@@ -234,43 +227,31 @@ int authenticateRFID() {
                     Serial.print(dogAuthID[i]);
                     Serial.println(" identified!");
                 }
-                windowMovementTimeout = dogWindowTime;
+                tachTarget = tachClosed + dogTach;
                 return 2;
             }
         }
-    }else {
-      if (digitalRead(PIN_SWITCH) == LOW) { // Basically treat the switch as another tag.
+    } else {
+      if (digitalRead(MANUAL_OPEN_PIN) == LOW) { // Basically treat the switch as another tag.
         if (debug) {
           Serial.print("switch triggered");
         }
-        windowMovementTimeout = dogWindowTime;
+        tachTarget = tachClosed + buttonTach;
         return 999;
       }
     }
     return -1;
 }
 
-// Use the lock servo to unlock the window.
-void openLock() {
-    if (debug) Serial.println("Lock open commanded.");
-    digitalWrite(PIN_SERVO_ENABLE, LOW); // Turn the servo on and off on each use to prevent humming and power use when not in use.
-    lock_servo.write(LOCK_OPEN_VAL);
-    delay(LOCK_DURATION);
-    digitalWrite(PIN_SERVO_ENABLE, HIGH);
-}
-
-// Use the lock servo to lock the window.
-void closeLock() {
-    if (debug) Serial.println("Lock close commanded.");
-    digitalWrite(PIN_SERVO_ENABLE, LOW); // Turn the servo on and off on each use to prevent humming and power use when not in use.
-    lock_servo.write(LOCK_CLOSE_VAL);
-    delay(LOCK_DURATION);
-    digitalWrite(PIN_SERVO_ENABLE, HIGH);
-}
-
 void loop() {
+  vesc.getVescValues();
+  float currTach = vesc.data.tachometer;
+
     switch(currentState) {
         case IDLE_CLOSED:
+            vesc.setCurrent(0.);
+            float tachClosed = currTach; // estimated position ticks in closed position.
+            
             // Don't check time or enforce curfew unless the system is idle.
             updateTime();
 
@@ -282,7 +263,8 @@ void loop() {
             // Be constantly checking the serial buffer for new RFID tag reads.
             // Unlock the window when a correct match occurs.
             if (authenticateRFID() >= 0) {
-                currentState = UNLOCKING;
+              lastEventStartTime = millis();
+              currentState = OPENING;
             }
             delay(LOOP_DELAY);
             break;
@@ -290,34 +272,22 @@ void loop() {
         case CURFEW:
             updateTime();
             if (hourTime < curfewStartTime && hourTime > curfewEndTime) {
+              lastEventStartTime = millis();
               currentState = IDLE_CLOSED;
             }
             delay(LOOP_DELAY * 100);
             break;
-        case UNLOCKING:
-            // Unlock the window, and transition to opening the window.
-            openLock();
-            lastEventStartTime = millis();
-            currentState = OPENING;
-            break;
-
-        case LOCKING:
-            // Lock the window, and go to idle.
-            closeLock();
-            currentState = IDLE_CLOSED;
-            break;
-
+            
         case OPENING:
-            // Start opening the window. Keep going until a time threshold or the endstop is hit. TODO: different durations for differently sized animals.
-            vesc.setRPM(RPM_OPENING);
 
-            // Stop opening when the endstop is triggered or too much time elapses.
-            if (digitalRead(PIN_ENDSTOP_OPEN) == LOW || (millis() - lastEventStartTime > windowMovementTimeout)) {
-                if (debug) Serial.println("Window is done opening.");
-
-                vesc.setCurrent(0.f);
-                currentState = WAITING_OPEN;
-                lastEventStartTime = millis();
+            if (digitalRead(PIN_ENDSTOP_OPEN) || currTach >= tachTarget || (millis() - lastEventStartTime > windowMovementTimeout)) {
+              if (debug) Serial.println("Window is done opening.");
+              currentState = WAITING_OPEN;
+              lastEventStartTime = millis();
+            } else if (currTach - tachClosed > slowPoint) {
+               vesc.setDuty(-(currTach - tachClosed - slowPoint)/(tachFullScale - slowPoint) * (maxDuty - minDuty) + maxDuty);
+            } else {
+               vesc.setDuty(maxDuty);
             }
             delay(LOOP_DELAY);
             break;
@@ -326,7 +296,8 @@ void loop() {
             // Wait for awhile with the window open to give time for the slowpokes to make up their minds. If a news
             // valid authentication occurs, reset the duration counter.
             if (authenticateRFID() >= 0) {
-                if (debug) Serial.println("Tag detected during window open time. Resetting the wait timer.");
+                if (debug) Serial.println("Tag detected during window open time.");
+                currentState = OPENING;
                 lastEventStartTime = millis();
             } else if (millis() - lastEventStartTime > stayOpenDuration) { // Time limit met for closing to occur.
                 if (debug) Serial.println("Done waiting with the window open.");
@@ -337,35 +308,28 @@ void loop() {
             break;
 
         case CLOSING:
-            vesc.setRPM(RPM_CLOSING);
-            vesc.getVescValues();
-            
             // Stop opening when the endstop is triggered or too much time elapses. If a tag gets authenticated during
             // this time. Reopen the window for the duration we had been closing it (or until endstop).
+            if (currTach - tachClosed <= 0.4 * tachFullScale) {
+              vesc.setDuty(-MOTOR_DUTY_SLOW);
+            } else {
+              vesc.setDuty(-MOTOR_DUTY_BASELINE);
+            }
             
             int tagCheck = authenticateRFID();
-            if (tagCheck >= 0 || ( vesc.data.avgMotorCurrent > CURRENT_LIMIT && (millis() - lastEventStartTime) > 1000)) {
+            if (tagCheck >= 0 || ( vesc.data.avgMotorCurrent > CURRENT_LIMIT && (millis() - lastEventStartTime) > 1000)) { // currTach - lastTach <= tachFullScale * 0.6
                 if (debug) Serial.println("Tag authenticated during window closing. Reopening.");
-
-                // For cats, only reopen for the length of time the window has been closing to maintain the same final aperture of the window.
-                // For dogs or button presses, just open until the endstop is hit.
-                if (tagCheck == 1) {
-                  unsigned long timeToReopen = millis() - lastEventStartTime; // How much time have we been closing the window so far?
-                  lastEventStartTime = millis() - (windowMovementTimeout - timeToReopen); // Cheat the timeout. Set the current time to be in the future so the timeout triggers after the amount of time we had been closing the window elapses.
-                } else {
-                  lastEventStartTime = millis();
-                }
-                
+                lastEventStartTime = millis();
                 currentState = OPENING; 
-            } else if (digitalRead(PIN_ENDSTOP_CLOSE) == LOW || (millis() - lastEventStartTime > maxClosingTime)) {
-                vesc.setCurrent(0.f);
-                currentState = LOCKING;
+            } else if (digitalRead(PIN_ENDSTOP_CLOSE) || (millis() - lastEventStartTime > windowMovementTimeout)) {
+                lastEventStartTime = millis();
+                currentState = IDLE_CLOSED;
                 if (debug) Serial.println("Window is done closing.");
             }
+            
             delay(LOOP_DELAY);
             break;
         default:
             if (debug) Serial.println("Unknown  Major bug.");
     }
-
 }
