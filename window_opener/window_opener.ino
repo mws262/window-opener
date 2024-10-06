@@ -1,5 +1,5 @@
-#define RFID_SERIAL Serial1
-#define VESC_SERIAL Serial5
+#define RFID_SERIAL Serial2
+#define VESC_SERIAL Serial4
 
 #include <VescUart.h>
 #include <SPI.h>
@@ -25,7 +25,7 @@ State currentState = CLOSING;
 
 /* Vesc motor control parameters */
 VescUart vesc;
-const float CURRENT_LIMIT = 1.0; // TODO tune this.
+const float CURRENT_LIMIT = 3.; // TODO tune this.
 const float MOTOR_DUTY_BASELINE = 0.04;
 const float MOTOR_DUTY_SLOW = 0.03;
 long lastTach = 0;
@@ -33,7 +33,7 @@ long lastTach = 0;
   float tachFullScale = 1800;
   float currTach = 0.0;
   float minDuty = 0.03;
-  float maxDuty = 0.15;
+  float maxDuty = 0.08;
   float slowPoint = tachFullScale/12.;
 
   float tachClosed = 0.0;
@@ -55,15 +55,15 @@ const char dogAuthID[NUM_DOGS][MAX_ID_LEN] = {"F9000202060000037A", // Piper col
 
 /* Switch parameters */
 // Endstop pins.
-const int PIN_ENDSTOP_CLOSE = 18;
-const int PIN_ENDSTOP_OPEN = 19;
+const int PIN_ENDSTOP_CLOSE = 40;
+const int PIN_ENDSTOP_OPEN = 39;
 
 // Momentary switch to open the window without a tag read.
-const int MANUAL_OPEN_PIN = 17;
+const int MANUAL_OPEN_PIN = 41;
 
 unsigned long lastEventStartTime;
 const int stayOpenDuration = 4000; // Milliseconds.
-const int windowMovementTimeout = 15000; // No single motion should take longer than this.
+const int windowMovementTimeout = 30000; // No single motion should take longer than this.
 
 
 /* Parameters for synchronizing clock via ethernet */
@@ -101,31 +101,15 @@ int setupEthernet() {
     return 0;
   }
   Udp.begin(localPort);
+  Serial.println("Opened ethernet connection");
   return 1;
-}
-
-void setup() {
-    if (debug) Serial.begin(9600); // Default serial is for communicating with the computer for debugging. Should eventually be eliminated.
-
-    RFID_SERIAL.begin(9600); // Serial 1 is for communication with the RFID board. Information only flows in from it.
-    VESC_SERIAL.begin(19200);
-    while (!VESC_SERIAL) {;}
-    vesc.setSerialPort(&VESC_SERIAL);
-
-    pinMode(PIN_ENDSTOP_CLOSE, INPUT);
-    pinMode(PIN_ENDSTOP_OPEN, INPUT);
-    pinMode(MANUAL_OPEN_PIN, INPUT);
-
-    setupEthernet();
-
-    lastEventStartTime = millis();
-    if (debug) Serial.println("Setup complete.");
 }
 
 // Update the current real time. Occasionlly check the internet. Keep track of time locally in between.
 void updateTime() {
 
   unsigned long timeSinceLastUpdate = millis() - lastTimeUpdate;
+//  Serial.println(timeSinceLastUpdate - timeCheckInterval);
   // Only synchonize from the internet occasionally.
   if (timeSinceLastUpdate > timeCheckInterval) {
     if (debug)
@@ -166,6 +150,7 @@ void updateTime() {
     }
 
     if (packetReceived) {
+      Serial.println("received time packet from server.");
       unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
       unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
       // combine the four bytes (two words) into a long integer
@@ -176,8 +161,9 @@ void updateTime() {
       // subtract seventy years:
       lastEpochRetrieved = secsSince1900 - seventyYears;
       timeSinceLastUpdate = 0;
+      lastTimeUpdate = millis();
+
     }
-    lastTimeUpdate = millis();
     Ethernet.maintain(); 
   }
 
@@ -196,12 +182,35 @@ void updateTime() {
   }
 }
 
+void setup() {
+    if (debug) {
+      Serial.begin(9600); // Default serial is for communicating with the computer for debugging. Should eventually be eliminated. 
+      Serial.println("beginning setup");
+    }
+
+    RFID_SERIAL.begin(9600); // Serial 1 is for communication with the RFID board. Information only flows in from it.
+    VESC_SERIAL.begin(19200);
+    while (!VESC_SERIAL) {;}
+    vesc.setSerialPort(&VESC_SERIAL);
+
+    pinMode(PIN_ENDSTOP_CLOSE, INPUT);
+    pinMode(PIN_ENDSTOP_OPEN, INPUT);
+    pinMode(MANUAL_OPEN_PIN, INPUT);
+
+    if (enforceCurfew) {
+      setupEthernet(); 
+      updateTime();
+    }
+
+    lastEventStartTime = millis();
+    if (debug) Serial.println("Setup complete.");
+}
+
 // Read from the serial buffer and check for a valid RFID tag. Returns the index of the tag id or -1 if the not authenticated.
 int authenticateRFID() {
   
     if (RFID_SERIAL.available()) {
       char id[64];
-      char byteRead;
       
       int availableBytes = RFID_SERIAL.available();
       for (int i = 0; i < availableBytes; i++) {
@@ -232,7 +241,7 @@ int authenticateRFID() {
             }
         }
     } else {
-      if (digitalRead(MANUAL_OPEN_PIN) == LOW) { // Basically treat the switch as another tag.
+      if (digitalRead(MANUAL_OPEN_PIN)) { // Basically treat the switch as another tag.
         if (debug) {
           Serial.print("switch triggered");
         }
@@ -243,17 +252,18 @@ int authenticateRFID() {
     return -1;
 }
 
+float currSpeedTarget = 0;
+
 void loop() {
   vesc.getVescValues();
   float currTach = vesc.data.tachometer;
-
     switch(currentState) {
         case IDLE_CLOSED:
             vesc.setCurrent(0.);
-            float tachClosed = currTach; // estimated position ticks in closed position.
+            tachClosed = currTach; // estimated position ticks in closed position.
             
             // Don't check time or enforce curfew unless the system is idle.
-            updateTime();
+            if (enforceCurfew) updateTime();
 
             if (hourTime > curfewStartTime || hourTime < curfewEndTime) {
               currentState = CURFEW;
@@ -271,7 +281,7 @@ void loop() {
 
         case CURFEW:
             updateTime();
-            if (hourTime < curfewStartTime && hourTime > curfewEndTime) {
+            if ((hourTime < curfewStartTime && hourTime > curfewEndTime) || !enforceCurfew) {
               lastEventStartTime = millis();
               currentState = IDLE_CLOSED;
             }
@@ -284,10 +294,19 @@ void loop() {
               if (debug) Serial.println("Window is done opening.");
               currentState = WAITING_OPEN;
               lastEventStartTime = millis();
-            } else if (currTach - tachClosed > slowPoint) {
-               vesc.setDuty(-(currTach - tachClosed - slowPoint)/(tachFullScale - slowPoint) * (maxDuty - minDuty) + maxDuty);
+            } else if (vesc.data.avgMotorCurrent > CURRENT_LIMIT && (millis() - lastEventStartTime) > 2000) {
+                if (debug){
+                  Serial.print("current limit exceeded: ");
+                  Serial.println(vesc.data.avgMotorCurrent);
+                }
+                lastEventStartTime = millis();
+                currentState = WAITING_OPEN; 
+            } else if (currTach - tachClosed > 0.6 * (tachTarget - tachClosed)) {
+              currSpeedTarget = currSpeedTarget * 0.5 + minDuty * 0.5;
+               vesc.setDuty(currSpeedTarget);
             } else {
-               vesc.setDuty(maxDuty);
+              currSpeedTarget = currSpeedTarget * 0.7 + maxDuty * 0.3;
+               vesc.setDuty(currSpeedTarget);
             }
             delay(LOOP_DELAY);
             break;
@@ -308,6 +327,7 @@ void loop() {
             break;
 
         case CLOSING:
+        {
             // Stop opening when the endstop is triggered or too much time elapses. If a tag gets authenticated during
             // this time. Reopen the window for the duration we had been closing it (or until endstop).
             if (currTach - tachClosed <= 0.4 * tachFullScale) {
@@ -317,8 +337,15 @@ void loop() {
             }
             
             int tagCheck = authenticateRFID();
-            if (tagCheck >= 0 || ( vesc.data.avgMotorCurrent > CURRENT_LIMIT && (millis() - lastEventStartTime) > 1000)) { // currTach - lastTach <= tachFullScale * 0.6
+            if (tagCheck >= 0) { // currTach - lastTach <= tachFullScale * 0.6
                 if (debug) Serial.println("Tag authenticated during window closing. Reopening.");
+                lastEventStartTime = millis();
+                currentState = OPENING; 
+            } else if (vesc.data.avgMotorCurrent > CURRENT_LIMIT && (millis() - lastEventStartTime) > 2000) {
+                if (debug){
+                  Serial.print("current limit exceeded: ");
+                  Serial.println(vesc.data.avgMotorCurrent);
+                }
                 lastEventStartTime = millis();
                 currentState = OPENING; 
             } else if (digitalRead(PIN_ENDSTOP_CLOSE) || (millis() - lastEventStartTime > windowMovementTimeout)) {
@@ -329,7 +356,10 @@ void loop() {
             
             delay(LOOP_DELAY);
             break;
+        }
         default:
             if (debug) Serial.println("Unknown  Major bug.");
+            
     }
+//    Serial.println(vesc.data.avgMotorCurrent);
 }
